@@ -101,6 +101,75 @@ llama_kv_cache::llama_kv_cache(
 
     const uint32_t n_layer = hparams.n_layer_all;
 
+    // LLAMA_KV_PAGED_BUFFER=1 asks for the attention KV tensors alone to live
+    // in the backend's paged KV buffer type, reached through the registry's
+    // proc-address table so this file names no backend. The request is
+    // explicit, so a backend that exposes no such type, a device that returns
+    // none, or a cache kept on the host is a refusal rather than a fallback
+    // to the ordinary buffer: a run that asked for the mechanism and served
+    // without it would measure nothing. The recurrent store is a different
+    // class with its own constructor and reads no part of this.
+    const char * paged_request = getenv("LLAMA_KV_PAGED_BUFFER");
+    const bool paged_buffer = paged_request != nullptr && strcmp(paged_request, "1") == 0;
+    if (paged_request != nullptr && !paged_buffer && strcmp(paged_request, "0") != 0) {
+        throw std::runtime_error(format("LLAMA_KV_PAGED_BUFFER must be 0 or 1, found '%s'", paged_request));
+    }
+    if (paged_buffer && !offload) {
+        throw std::runtime_error("LLAMA_KV_PAGED_BUFFER=1 requires the KV cache on a device");
+    }
+
+    // LLAMA_KV_PAGED_RESIDENCY names the residency policy of the paged buffer:
+    // full backs every unit for the buffer's life, tails backs the intervals
+    // this cache declares and reclaims the tails above them. Tails is
+    // refused on a transposed V layout, whose cells are strided across the
+    // tensor rather than laid out as rows from offset 0, and on a cache that
+    // shares another cache's cells, whose apply and removal paths return
+    // ahead of any declaration; both are stated refusals rather than modes
+    // served under the name.
+    const char * residency_request = getenv("LLAMA_KV_PAGED_RESIDENCY");
+    if (residency_request != nullptr && !paged_buffer) {
+        throw std::runtime_error("LLAMA_KV_PAGED_RESIDENCY requires LLAMA_KV_PAGED_BUFFER=1");
+    }
+    if (residency_request != nullptr && strcmp(residency_request, "full") != 0 && strcmp(residency_request, "tails") != 0) {
+        throw std::runtime_error(format("LLAMA_KV_PAGED_RESIDENCY must be full or tails, found '%s'", residency_request));
+    }
+    paged_residency_tails = residency_request != nullptr && strcmp(residency_request, "tails") == 0;
+    if (paged_residency_tails && v_trans) {
+        throw std::runtime_error("LLAMA_KV_PAGED_RESIDENCY=tails requires a row-major V cache (flash attention on)");
+    }
+    if (paged_residency_tails && other != nullptr) {
+        throw std::runtime_error("LLAMA_KV_PAGED_RESIDENCY=tails is refused on a cache sharing another cache's cells");
+    }
+    const char * paged_buft_proc_name = paged_residency_tails
+        ? "ggml_backend_cuda_paged_kv_sparse_buffer_type"
+        : "ggml_backend_cuda_paged_kv_buffer_type";
+    auto paged_buft_for_dev = [paged_buft_proc_name](ggml_backend_dev_t dev) -> ggml_backend_buffer_type_t {
+        ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
+        typedef ggml_backend_buffer_type_t (*paged_kv_buffer_type_t)(int device);
+        auto paged_kv_buffer_type_fn = (paged_kv_buffer_type_t)
+            ggml_backend_reg_get_proc_address(reg, paged_buft_proc_name);
+        if (paged_kv_buffer_type_fn == nullptr) {
+            throw std::runtime_error(format("LLAMA_KV_PAGED_BUFFER=1: backend %s exposes no %s",
+                    ggml_backend_reg_name(reg), paged_buft_proc_name));
+        }
+        int dev_index = -1;
+        for (size_t i = 0; i < ggml_backend_reg_dev_count(reg); ++i) {
+            if (ggml_backend_reg_dev_get(reg, i) == dev) {
+                dev_index = (int) i;
+                break;
+            }
+        }
+        if (dev_index < 0) {
+            throw std::runtime_error(format("device %s not found in its backend reg", ggml_backend_dev_name(dev)));
+        }
+        ggml_backend_buffer_type_t buft = paged_kv_buffer_type_fn(dev_index);
+        if (buft == nullptr) {
+            throw std::runtime_error(format("LLAMA_KV_PAGED_BUFFER=1: device %s offers no paged KV buffer type",
+                    ggml_backend_dev_name(dev)));
+        }
+        return buft;
+    };
+
     // define a comparator for the buft -> ctx map to ensure that the order is well-defined:
     struct ggml_backend_buft_comparator {
         bool operator()(const ggml_backend_buffer_type_t & lhs, const ggml_backend_buffer_type_t & rhs) const {
@@ -179,6 +248,19 @@ llama_kv_cache::llama_kv_cache(
             if (il_share >= 0) {
                 const auto & layer_share = other->layers[other->map_layer_ids[il_share]];
 
+                // A shared layer keeps the buffer the other cache allocated,
+                // so a paged request is honored only where that buffer is
+                // the paged type of the layer's own device; an ordinary
+                // buffer inherited under the request would serve the pinned
+                // path while the log claimed the mechanism.
+                if (paged_buffer) {
+                    ggml_backend_buffer_type_t shared_buft = ggml_backend_buffer_get_type(layer_share.k->buffer);
+                    ggml_backend_buffer_type_t paged_buft  = paged_buft_for_dev(model.dev_layer(il));
+                    if (shared_buft != paged_buft || (layer_share.v && ggml_backend_buffer_get_type(layer_share.v->buffer) != paged_buft)) {
+                        throw std::runtime_error(format("LLAMA_KV_PAGED_BUFFER=1: layer %d shares layer %d whose buffer is not the paged KV type", il, il_share));
+                    }
+                }
+
                 LLAMA_LOG_WARN("%s: layer %3d: sharing with layer %d. k = %p, v = %p\n", __func__, il, il_share,
                         layer_share.k->data, layer_share.v->data);
 
@@ -215,7 +297,7 @@ llama_kv_cache::llama_kv_cache(
 
         if (offload) {
             auto * dev = model.dev_layer(il);
-            buft = ggml_backend_dev_buffer_type(dev);
+            buft = paged_buffer ? paged_buft_for_dev(dev) : ggml_backend_dev_buffer_type(dev);
 
             dev_name = ggml_backend_dev_name(dev);
         }
@@ -289,7 +371,24 @@ llama_kv_cache::llama_kv_cache(
         }
 
         LLAMA_LOG_INFO("%s: %10s KV buffer size = %8.2f MiB\n", __func__, ggml_backend_buffer_name(buf), ggml_backend_buffer_get_size(buf)/1024.0/1024.0);
+        LLAMA_LOG_INFO("%s: kv_buffer_kind=%s buffer=%s residency=%s\n", __func__,
+                paged_buffer ? "paged_kv_vmm" : "device_default", ggml_backend_buffer_name(buf),
+                paged_buffer ? (paged_residency_tails ? "tails" : "full") : "-");
 
+        if (paged_residency_tails && !hparams.no_alloc) {
+            ggml_backend_dev_t dev = ggml_backend_buft_get_device(buft);
+            ggml_backend_reg_t reg = dev ? ggml_backend_dev_backend_reg(dev) : nullptr;
+            auto require_fn = reg ? (paged_kv_require_fn_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_paged_kv_require") : nullptr;
+            if (require_fn == nullptr) {
+                throw std::runtime_error(format("LLAMA_KV_PAGED_RESIDENCY=tails: buffer %s exposes no paged KV require entry point",
+                        ggml_backend_buffer_name(buf)));
+            }
+            paged_require_fns.emplace_back(buf, require_fn);
+        }
+
+        // Under the tails policy the buffer holds no unit yet, so this clears
+        // the resident set alone and every unit committed later is zeroed
+        // ahead of its first reader.
         ggml_backend_buffer_clear(buf, 0);
         ctxs_bufs.emplace_back(std::move(ctx), buf);
     }
@@ -395,6 +494,8 @@ void llama_kv_cache::clear(bool data) {
             ggml_backend_buffer_clear(buf.get(), 0);
         }
     }
+
+    residency_update(true, false);
 }
 
 bool llama_kv_cache::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
@@ -463,6 +564,11 @@ bool llama_kv_cache::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
         }
     }
 
+    // A removal is where a tail can leave the access envelope; a reclaim
+    // that the backend refuses leaves the units backed and the cache
+    // runnable, which the entry point has already logged.
+    residency_update(true, false);
+
     return true;
 }
 
@@ -522,6 +628,17 @@ void llama_kv_cache::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id_dst, ll
     }
 
     GGML_ASSERT(is_full && "seq_cp() is only supported for full KV buffers");
+
+    // The copy moves whole streams at the next update, and the cell metadata
+    // below already describes the destination, so the whole tensors are
+    // backed here, ahead of the metadata; a refusal here leaves the cache as
+    // it was, where a refusal at the update would leave the destination
+    // described and unwritten. The copy API carries no failure channel, so
+    // the refusal is the same class of stop the assertion above is.
+    if (!residency_update(false, true)) {
+        LLAMA_LOG_ERROR("%s: paged KV residency refused the whole-tensor requirement for a cross-stream copy\n", __func__);
+        GGML_ABORT("paged KV residency refused a cross-stream copy");
+    }
 
     // enqueue the copy operation - the buffer copy will be performed during the next update
     sc_info.ssrc.push_back(s0);
@@ -583,6 +700,8 @@ void llama_kv_cache::seq_keep(llama_seq_id seq_id) {
     if (new_head != cells.size() && new_head < head) {
         head = new_head;
     }
+
+    residency_update(true, false);
 }
 
 void llama_kv_cache::seq_add(llama_seq_id seq_id, llama_pos p0, llama_pos p1, llama_pos shift) {
@@ -614,6 +733,15 @@ void llama_kv_cache::seq_add(llama_seq_id seq_id, llama_pos p0, llama_pos p1, ll
     // If there is no range then return early to avoid looping over all cells.
     if (p0 == p1) {
         return;
+    }
+
+    // A shift is applied by a graph over every K row at the next update, so
+    // the whole tensors are backed ahead of the first cell that records it,
+    // and after the empty-range return so a call that shifts nothing backs
+    // nothing.
+    if (!residency_update(false, true)) {
+        LLAMA_LOG_ERROR("%s: paged KV residency refused the whole-tensor requirement for a K-shift\n", __func__);
+        GGML_ABORT("paged KV residency refused a K-shift");
     }
 
     for (uint32_t i = 0; i < cells.size(); ++i) {
@@ -661,6 +789,11 @@ void llama_kv_cache::seq_div(llama_seq_id seq_id, llama_pos p0, llama_pos p1, in
     // If there is no range then return early to avoid looping over the cache.
     if (p0 == p1) {
         return;
+    }
+
+    if (!residency_update(false, true)) {
+        LLAMA_LOG_ERROR("%s: paged KV residency refused the whole-tensor requirement for a K-shift\n", __func__);
+        GGML_ABORT("paged KV residency refused a K-shift");
     }
 
     for (uint32_t i = 0; i < cells.size(); ++i) {
@@ -807,7 +940,10 @@ llama_kv_cache::slot_info_vec_t llama_kv_cache::prepare(const std::vector<llama_
         }
 
         // now emplace the ubatch
-        apply_ubatch(sinfo_new, ubatch);
+        if (!apply_ubatch(sinfo_new, ubatch)) {
+            success = false;
+            break;
+        }
     }
 
     GGML_ASSERT(!states.empty() || !success);
@@ -841,6 +977,20 @@ bool llama_kv_cache::update(llama_context * lctx, bool do_shift, const stream_co
     bool updated = false;
 
     auto * sched = lctx->get_sched();
+
+    // A cross-stream copy moves whole streams and a K-shift views every K
+    // row of every stream. seq_cp, seq_add, and seq_div backed the whole
+    // tensors ahead of the metadata that describes each, so this repeat is
+    // a check that nothing released them since; the return value of this
+    // function reports whether a graph ran rather than whether it succeeded
+    // and llama_kv_cache_context::apply() reads it as neither, so a refusal
+    // here, which would leave a described destination unwritten, stops the
+    // process by name rather than returning.
+    if ((!sc_info.empty() || do_shift) && !residency_update(false, true)) {
+        LLAMA_LOG_ERROR("%s: paged KV residency refused the whole-tensor requirement for %s\n", __func__,
+                !sc_info.empty() ? "a stream copy" : "a K-shift");
+        GGML_ABORT("paged KV residency refused a maintenance requirement whose metadata is already applied");
+    }
 
     if (!sc_info.empty()) {
         assert(n_stream > 1 && "stream copy should never happen with a single stream");
@@ -1112,10 +1262,10 @@ llama_kv_cache::slot_info llama_kv_cache::find_slot(const llama_ubatch & ubatch,
     return res;
 }
 
-void llama_kv_cache::apply_ubatch(const slot_info & sinfo, const llama_ubatch & ubatch) {
+bool llama_kv_cache::apply_ubatch(const slot_info & sinfo, const llama_ubatch & ubatch) {
     // TODO: refactor [TAG_KV_CACHE_SHARE_CELLS]
     if (other) {
-        return;
+        return true;
     }
 
     // keep track of the max sequence position that we would overwrite with this ubatch
@@ -1203,6 +1353,64 @@ void llama_kv_cache::apply_ubatch(const slot_info & sinfo, const llama_ubatch & 
 
         head = sinfo.idxs[s].back() + 1;
     }
+
+    // The cells the ubatch occupies and the padded attention extent over
+    // them are the envelope the next graph reads and writes, so the backing
+    // is committed here, ahead of the graph that touches it.
+    return residency_update(false, false);
+}
+
+bool llama_kv_cache::residency_update(bool reclaim, bool whole) {
+    if (!paged_residency_tails) {
+        return true;
+    }
+
+    // The rows required per stream: the padded attention extent get_n_kv()
+    // computes, taken over every stream because get_n_kv() takes its maximum
+    // over the ubatch's streams and every stream in the ubatch is viewed at
+    // that extent, floored at the 256-row minimum the graph is built with;
+    // or the whole tensor for the operations that touch every row.
+    const uint32_t n_pad_cur = std::max(n_pad, 256u);
+
+    uint32_t rows = 0;
+    if (whole) {
+        rows = get_size();
+    } else {
+        for (uint32_t s = 0; s < n_stream; ++s) {
+            const auto & cells = v_cells[s];
+            rows = std::max(rows, std::min(cells.size(), std::max(n_pad_cur, GGML_PAD(cells.used_max_p1(), n_pad_cur))));
+        }
+    }
+
+    for (const auto & [buf, require_fn] : paged_require_fns) {
+        std::vector<size_t> offsets;
+        std::vector<size_t> sizes;
+
+        const char * base = (const char *) ggml_backend_buffer_get_base(buf);
+
+        for (const auto & layer : layers) {
+            for (ggml_tensor * t : { layer.k, layer.v }) {
+                if (t == nullptr || t->buffer != buf) {
+                    continue;
+                }
+                // One interval per stream: rows [0, rows) of the stream, at
+                // the tensor's own row stride and stream stride.
+                const size_t offset = (size_t) ((const char *) t->data - base);
+                for (uint32_t s = 0; s < n_stream; ++s) {
+                    offsets.push_back(offset + (size_t) s*t->nb[2]);
+                    sizes.push_back((size_t) rows*t->nb[1]);
+                }
+            }
+        }
+
+        if (!require_fn(buf, offsets.data(), sizes.data(), offsets.size(), reclaim)) {
+            LLAMA_LOG_ERROR("%s: paged KV residency %s refused on buffer %s at %u rows\n", __func__,
+                    reclaim ? "reclaim" : "commit", ggml_backend_buffer_name(buf), rows);
+            return false;
+        }
+    }
+
+    return true;
 }
 
 bool llama_kv_cache::get_can_shift() const {
@@ -2447,7 +2655,10 @@ bool llama_kv_cache::state_read_meta(llama_io_read_i & io, uint32_t strm, uint32
         // note: apply_ubatch() rebuilds llama_kv_cell_ext from the ubatch
         //       only ext.tok and the M-RoPE 2D position round-trip through it
         //       see: https://github.com/ggml-org/llama.cpp/pull/16825#issuecomment-3460868350
-        apply_ubatch(sinfo, ubatch);
+        if (!apply_ubatch(sinfo, ubatch)) {
+            LLAMA_LOG_ERROR("%s: failed to back %d restored cells in the paged KV buffer\n", __func__, cell_count);
+            return false;
+        }
 
         // apply_ubatch() takes the 2D position from the ubatch, and that ubatch is built with this
         // cache's own n_pos_per_embd. a cache that does not use M-RoPE itself but mirrors one that
@@ -2579,6 +2790,14 @@ bool llama_kv_cache::state_read_data(llama_io_read_i & io, uint32_t strm, uint32
 
     if (n_rot_v_ref != n_rot_v) {
         LLAMA_LOG_ERROR("%s: incompatible value rotation (%u instead of %u)\n", __func__, n_rot_v_ref, n_rot_v);
+        return false;
+    }
+
+    // The destination cells were placed by state_read_meta, either through
+    // apply_ubatch or directly for a whole-cache restore, so the backing over
+    // them is committed here ahead of the first read_tensor into the buffer.
+    if (!residency_update(false, false)) {
+        LLAMA_LOG_ERROR("%s: paged KV residency refused the restore destination\n", __func__);
         return false;
     }
 
@@ -2863,7 +3082,9 @@ bool llama_kv_cache_context::apply() {
         return true;
     }
 
-    kv->apply_ubatch(sinfos[i_cur], ubatches[i_cur]);
+    if (!kv->apply_ubatch(sinfos[i_cur], ubatches[i_cur])) {
+        return false;
+    }
     n_kv = kv->get_n_kv(sinfos[i_cur]);
 
     return true;

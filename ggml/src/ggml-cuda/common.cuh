@@ -1177,6 +1177,7 @@ struct ggml_cuda_device_info {
         bool    integrated;                     // Device is integrated as opposed to discrete
         bool    vmm;                            // virtual memory support
         size_t  vmm_granularity;                // granularity of virtual memory
+        size_t  vmm_granularity_minimum;        // the granularity cuMemMap requires of an address, size, and offset
         size_t  total_vram;
         int     warp_size;                      // Number of threads in a dispatch
         bool    supports_cooperative_launch;    // whether cooperative launch is supported

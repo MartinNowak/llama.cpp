@@ -4,6 +4,7 @@
 
 #include "ggml-cuda/allreduce.cuh"
 #include "ggml-cuda/common.cuh"
+#include "ggml-cuda/paged-kv-residency.h"
 #include "ggml-cuda/acc.cuh"
 #include "ggml-cuda/add-id.cuh"
 #include "ggml-cuda/arange.cuh"
@@ -85,6 +86,7 @@
 #include <limits>
 #include <map>
 #include <memory>
+#include <chrono>
 #include <mutex>
 #include <cstdarg>
 #include <cstdio>
@@ -289,6 +291,7 @@ static ggml_cuda_device_info ggml_cuda_init() {
             alloc_prop.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
             alloc_prop.location.id = physical_id;
             CU_CHECK(cuMemGetAllocationGranularity(&info.devices[id].vmm_granularity, &alloc_prop, CU_MEM_ALLOC_GRANULARITY_RECOMMENDED));
+            CU_CHECK(cuMemGetAllocationGranularity(&info.devices[id].vmm_granularity_minimum, &alloc_prop, CU_MEM_ALLOC_GRANULARITY_MINIMUM));
         }
 #endif // defined(GGML_USE_VMM)
         info.devices[id].vmm = !!device_vmm;
@@ -718,10 +721,46 @@ ggml_backend_cuda_context::~ggml_backend_cuda_context() {
 
 // cuda buffer
 
+// A CUDA buffer is backed one of two ways and the context names which. A
+// cudaMalloc buffer is the ordinary device buffer. A KV VMM buffer is one
+// stable virtual aperture reserved through cuMemAddressReserve, physically
+// backed through cuMemCreate and cuMemMap, and granted read/write access on
+// its own device; every tensor placed in it starts and ends on a multiple of
+// the driver's minimum allocation granularity, which is the unit cuMemMap
+// requires of an address, a size, and an offset. Every unit of the aperture
+// is backed by its own cuMemCreate handle, mapped by its own cuMemMap, and
+// granted access on its own, because cuMemUnmap removes a mapping whole and
+// the driver returns physical memory only after every mapping and handle
+// reference to it is gone: a unit is the one extent a residency policy can
+// unmap and release on its own. The residency engine in paged-kv-residency.h
+// owns the unit table and the five accounting quantities and runs the commit
+// and reclaim transactions against the driver operations below. The buffer
+// type names the policy: the full type commits every unit at allocation, so
+// physical_mapped_bytes equals virtual_reserved_bytes for its whole life and
+// the buffer proves address stability and layout alone; the sparse type
+// commits nothing at allocation and backs the byte intervals its owner
+// requires through ggml_backend_cuda_paged_kv_require, reclaiming the units
+// a requirement set has released at the same call. Both kinds share one
+// buffer interface, so a reader that identifies CUDA memory by that
+// interface treats them alike.
+enum ggml_backend_cuda_buffer_kind {
+    GGML_CUDA_BUFFER_KIND_CUDA_MALLOC,
+    GGML_CUDA_BUFFER_KIND_KV_VMM,
+};
+
 struct ggml_backend_cuda_buffer_context {
     int device;
     void * dev_ptr = nullptr;
     std::string name;
+    ggml_backend_cuda_buffer_kind kind = GGML_CUDA_BUFFER_KIND_CUDA_MALLOC;
+    bool vmm_sparse = false;
+    size_t vmm_unit_bytes = 0;
+    size_t vmm_virtual_reserved_bytes = 0;
+    ggml_paged_kv_residency * vmm_residency = nullptr;
+#if defined(GGML_USE_VMM)
+    // The driver operations the residency engine calls, bound to this context.
+    ggml_paged_kv_driver vmm_driver;
+#endif // defined(GGML_USE_VMM)
 
     ggml_backend_cuda_buffer_context(int device, void * dev_ptr) :
         device(device), dev_ptr(dev_ptr),
@@ -729,9 +768,144 @@ struct ggml_backend_cuda_buffer_context {
     }
 
     ~ggml_backend_cuda_buffer_context() {
-        CUDA_CHECK(cudaFree(dev_ptr));
+        switch (kind) {
+            case GGML_CUDA_BUFFER_KIND_CUDA_MALLOC:
+                CUDA_CHECK(cudaFree(dev_ptr));
+                break;
+            case GGML_CUDA_BUFFER_KIND_KV_VMM:
+#if defined(GGML_USE_VMM)
+                // The driver requires every mapping inside a reservation to be
+                // unmapped before the reservation is released, and a handle
+                // is released after its mapping is gone so the physical
+                // memory returns to the device rather than to a dangling
+                // reference.
+                if (dev_ptr != nullptr) {
+                    ggml_cuda_set_device(device);
+                    if (vmm_residency != nullptr) {
+                        const ggml_paged_kv_transaction tx = vmm_residency->destroy(vmm_driver);
+                        if (!tx.ok) {
+                            GGML_LOG_ERROR("%s: paged_kv_residency op=destroy step=%s unit=%zu status=%d\n",
+                                           __func__, tx.step, tx.unit_index, tx.status);
+                        }
+                    }
+                    CU_CHECK(cuMemAddressFree((CUdeviceptr) dev_ptr, vmm_virtual_reserved_bytes));
+                }
+                delete vmm_residency;
+                vmm_residency = nullptr;
+#else
+                GGML_ABORT("KV VMM buffer in a build without GGML_USE_VMM");
+#endif // defined(GGML_USE_VMM)
+                break;
+        }
     }
 };
+
+#if defined(GGML_USE_VMM)
+// The driver operations behind the residency engine. Each acts on one unit
+// of the context's reservation, addressed as dev_ptr + index*unit, and
+// returns the CUresult as an int so the engine records the status it failed
+// on. Zeroing runs on the per-thread stream and completes on the host before
+// it returns, so every compute submission that follows it in program order
+// reads zeros; quiescing is a device-wide synchronization, the conservative
+// boundary the first candidate uses ahead of any unmap.
+static int ggml_backend_cuda_paged_kv_drv_create(void * user, size_t unit_index, uint64_t * handle) {
+    ggml_backend_cuda_buffer_context * ctx = (ggml_backend_cuda_buffer_context *) user;
+    CUmemAllocationProp prop = {};
+    prop.type = CU_MEM_ALLOCATION_TYPE_PINNED;
+    prop.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
+    prop.location.id = ggml_cuda_get_physical_device(ctx->device);
+    CUmemGenericAllocationHandle h = 0;
+    const CUresult r = cuMemCreate(&h, ctx->vmm_unit_bytes, &prop, 0);
+    *handle = (uint64_t) h;
+    GGML_UNUSED(unit_index);
+    return (int) r;
+}
+
+static int ggml_backend_cuda_paged_kv_drv_map(void * user, size_t unit_index, uint64_t handle) {
+    ggml_backend_cuda_buffer_context * ctx = (ggml_backend_cuda_buffer_context *) user;
+    return (int) cuMemMap((CUdeviceptr) ctx->dev_ptr + unit_index*ctx->vmm_unit_bytes, ctx->vmm_unit_bytes, 0,
+                          (CUmemGenericAllocationHandle) handle, 0);
+}
+
+static int ggml_backend_cuda_paged_kv_drv_set_access(void * user, size_t unit_index) {
+    ggml_backend_cuda_buffer_context * ctx = (ggml_backend_cuda_buffer_context *) user;
+    CUmemAccessDesc access = {};
+    access.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
+    access.location.id = ggml_cuda_get_physical_device(ctx->device);
+    access.flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
+    return (int) cuMemSetAccess((CUdeviceptr) ctx->dev_ptr + unit_index*ctx->vmm_unit_bytes, ctx->vmm_unit_bytes, &access, 1);
+}
+
+static int ggml_backend_cuda_paged_kv_drv_zero(void * user, size_t unit_index) {
+    ggml_backend_cuda_buffer_context * ctx = (ggml_backend_cuda_buffer_context *) user;
+    cudaError_t e = cudaMemsetAsync((char *) ctx->dev_ptr + unit_index*ctx->vmm_unit_bytes, 0, ctx->vmm_unit_bytes, cudaStreamPerThread);
+    if (e != cudaSuccess) {
+        return (int) e;
+    }
+    e = cudaStreamSynchronize(cudaStreamPerThread);
+    return (int) e;
+}
+
+static int ggml_backend_cuda_paged_kv_drv_quiesce(void * user) {
+    GGML_UNUSED(user);
+    return (int) cudaDeviceSynchronize();
+}
+
+static int ggml_backend_cuda_paged_kv_drv_unmap(void * user, size_t unit_index) {
+    ggml_backend_cuda_buffer_context * ctx = (ggml_backend_cuda_buffer_context *) user;
+    return (int) cuMemUnmap((CUdeviceptr) ctx->dev_ptr + unit_index*ctx->vmm_unit_bytes, ctx->vmm_unit_bytes);
+}
+
+static int ggml_backend_cuda_paged_kv_drv_release(void * user, uint64_t handle) {
+    GGML_UNUSED(user);
+    return (int) cuMemRelease((CUmemGenericAllocationHandle) handle);
+}
+
+static ggml_paged_kv_driver ggml_backend_cuda_paged_kv_driver(ggml_backend_cuda_buffer_context * ctx) {
+    ggml_paged_kv_driver drv;
+    drv.user       = ctx;
+    drv.create     = ggml_backend_cuda_paged_kv_drv_create;
+    drv.map        = ggml_backend_cuda_paged_kv_drv_map;
+    drv.set_access = ggml_backend_cuda_paged_kv_drv_set_access;
+    drv.zero       = ggml_backend_cuda_paged_kv_drv_zero;
+    drv.quiesce    = ggml_backend_cuda_paged_kv_drv_quiesce;
+    drv.unmap      = ggml_backend_cuda_paged_kv_drv_unmap;
+    drv.release    = ggml_backend_cuda_paged_kv_drv_release;
+    return drv;
+}
+#endif // defined(GGML_USE_VMM)
+
+// A host-driven write or read of a paged KV buffer has to land on published
+// units: the residency policy backs every interval its owner declared, so an
+// access outside them is an invariant violation of the caller rather than a
+// driver condition, and it ends the process here rather than as a device
+// fault whose report names nothing.
+static void ggml_backend_cuda_paged_kv_assert_resident(ggml_backend_cuda_buffer_context * ctx, const void * address, size_t size, const char * op) {
+    if (ctx->kind != GGML_CUDA_BUFFER_KIND_KV_VMM || ctx->vmm_residency == nullptr) {
+        return;
+    }
+    const size_t offset = (size_t) ((const char *) address - (const char *) ctx->dev_ptr);
+    if (!ctx->vmm_residency->resident(offset, size)) {
+        GGML_LOG_ERROR("%s: paged_kv_residency violation op=%s offset=%zu size=%zu unit_bytes=%zu\n",
+                       __func__, op, offset, size, ctx->vmm_unit_bytes);
+        GGML_ABORT("paged KV access outside the resident set");
+    }
+}
+
+// Memset over the published units of an interval alone; an unpublished unit
+// is zeroed when it is committed, so a clear to zero holds across the whole
+// reservation by construction, and a clear to any other value is refused on
+// the sparse type because an unbacked unit cannot carry it.
+static void ggml_backend_cuda_paged_kv_memset_resident(ggml_backend_cuda_buffer_context * ctx, void * address, uint8_t value, size_t size) {
+    if (ctx->vmm_sparse && value != 0) {
+        GGML_ABORT("the sparse paged KV buffer clears to zero alone");
+    }
+    const size_t offset = (size_t) ((char *) address - (char *) ctx->dev_ptr);
+    ctx->vmm_residency->for_each_resident_run(offset, size, [&](size_t run_offset, size_t run_size) {
+        CUDA_CHECK(cudaMemsetAsync((char *) ctx->dev_ptr + run_offset, value, run_size, cudaStreamPerThread));
+    });
+    CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
+}
 
 static void ggml_backend_cuda_buffer_free_buffer(ggml_backend_buffer_t buffer) {
     ggml_backend_cuda_buffer_context * ctx = (ggml_backend_cuda_buffer_context *)buffer->context;
@@ -755,6 +929,28 @@ static enum ggml_status ggml_backend_cuda_buffer_init_tensor(ggml_backend_buffer
         return GGML_STATUS_SUCCESS;
     }
 
+    if (ctx->kind == GGML_CUDA_BUFFER_KIND_KV_VMM) {
+        // The allocator pads every extent to the buffer type's alignment and
+        // places every start on it, so both facts hold by construction; they
+        // are asserted rather than assumed because a mapping unit that
+        // straddled two tensors is the case a later sparse mapping cannot
+        // survive, and the record is what a harness reads the layout from.
+        const size_t unit         = ctx->vmm_unit_bytes;
+        const size_t offset       = (size_t) ((const char *) tensor->data - (const char *) ctx->dev_ptr);
+        const size_t nbytes       = ggml_nbytes(tensor);
+        const size_t alloc_bytes  = ggml_backend_buft_get_alloc_size(buffer->buft, tensor);
+        const size_t padded_bytes = GGML_PAD(alloc_bytes, unit);
+        GGML_ASSERT(unit > 0 && offset % unit == 0);
+        GGML_ASSERT(offset + padded_bytes <= ctx->vmm_virtual_reserved_bytes);
+        GGML_LOG_INFO("%s: paged_kv_tensor name=%s type=%s ne0=%" PRId64 " ne1=%" PRId64 " ne2=%" PRId64
+                      " row_bytes=%zu nbytes=%zu alloc_bytes=%zu padded_bytes=%zu offset=%zu unit_bytes=%zu"
+                      " start_aligned=%s extent_aligned=%s\n",
+                      __func__, ggml_get_name(tensor), ggml_type_name(tensor->type),
+                      tensor->ne[0], tensor->ne[1], tensor->ne[2],
+                      ggml_row_size(tensor->type, tensor->ne[0]), nbytes, alloc_bytes, padded_bytes,
+                      offset, unit, offset % unit == 0 ? "yes" : "no", padded_bytes % unit == 0 ? "yes" : "no");
+    }
+
     if (ggml_is_quantized(tensor->type) && tensor->view_src == nullptr && ggml_backend_buffer_get_usage(buffer) != GGML_BACKEND_BUFFER_USAGE_COMPUTE) {
         // initialize padding to 0 to avoid possible NaN values
         const size_t original_size = ggml_nbytes(tensor);
@@ -762,8 +958,12 @@ static enum ggml_status ggml_backend_cuda_buffer_init_tensor(ggml_backend_buffer
 
         if (padded_size > original_size) {
             ggml_cuda_set_device(ctx->device);
-            CUDA_CHECK(cudaMemsetAsync((char *)tensor->data + original_size, 0, padded_size - original_size, cudaStreamPerThread));
-            CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
+            if (ctx->kind == GGML_CUDA_BUFFER_KIND_KV_VMM && ctx->vmm_residency != nullptr) {
+                ggml_backend_cuda_paged_kv_memset_resident(ctx, (char *)tensor->data + original_size, 0, padded_size - original_size);
+            } else {
+                CUDA_CHECK(cudaMemsetAsync((char *)tensor->data + original_size, 0, padded_size - original_size, cudaStreamPerThread));
+                CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
+            }
         }
     }
     return GGML_STATUS_SUCCESS;
@@ -773,6 +973,7 @@ static void ggml_backend_cuda_buffer_memset_tensor(ggml_backend_buffer_t buffer,
     ggml_backend_cuda_buffer_context * ctx = (ggml_backend_cuda_buffer_context *) buffer->context;
 
     ggml_cuda_set_device(ctx->device);
+    ggml_backend_cuda_paged_kv_assert_resident(ctx, (char *) tensor->data + offset, size, "memset_tensor");
     CUDA_CHECK(cudaMemsetAsync((char *) tensor->data + offset, value, size, cudaStreamPerThread));
     CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
 }
@@ -781,6 +982,7 @@ static void ggml_backend_cuda_buffer_set_tensor(ggml_backend_buffer_t buffer, gg
     ggml_backend_cuda_buffer_context * ctx = (ggml_backend_cuda_buffer_context *) buffer->context;
 
     ggml_cuda_set_device(ctx->device);
+    ggml_backend_cuda_paged_kv_assert_resident(ctx, (char *) tensor->data + offset, size, "set_tensor");
     CUDA_CHECK(cudaMemcpyAsync((char *) tensor->data + offset, data, size, cudaMemcpyHostToDevice, cudaStreamPerThread));
     CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
 }
@@ -789,6 +991,7 @@ static void ggml_backend_cuda_buffer_get_tensor(ggml_backend_buffer_t buffer, co
     ggml_backend_cuda_buffer_context * ctx = (ggml_backend_cuda_buffer_context *) buffer->context;
 
     ggml_cuda_set_device(ctx->device);
+    ggml_backend_cuda_paged_kv_assert_resident(ctx, (const char *) tensor->data + offset, size, "get_tensor");
     CUDA_CHECK(cudaMemcpyAsync(data, (const char *) tensor->data + offset, size, cudaMemcpyDeviceToHost, cudaStreamPerThread));
     CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
 }
@@ -798,6 +1001,7 @@ static void ggml_backend_cuda_buffer_set_tensor_2d(ggml_backend_buffer_t buffer,
     ggml_backend_cuda_buffer_context * ctx = (ggml_backend_cuda_buffer_context *) buffer->context;
 
     ggml_cuda_set_device(ctx->device);
+    ggml_backend_cuda_paged_kv_assert_resident(ctx, (char *) tensor->data + offset, n_copies > 0 ? (n_copies - 1)*stride_tensor + size : 0, "set_tensor_2d");
     CUDA_CHECK(cudaMemcpy2DAsync(
         (char *) tensor->data + offset, stride_tensor, data, stride_data, size, n_copies, cudaMemcpyHostToDevice, cudaStreamPerThread));
     CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
@@ -808,6 +1012,7 @@ static void ggml_backend_cuda_buffer_get_tensor_2d(ggml_backend_buffer_t buffer,
     ggml_backend_cuda_buffer_context * ctx = (ggml_backend_cuda_buffer_context *)buffer->context;
 
     ggml_cuda_set_device(ctx->device);
+    ggml_backend_cuda_paged_kv_assert_resident(ctx, (const char *) tensor->data + offset, n_copies > 0 ? (n_copies - 1)*stride_tensor + size : 0, "get_tensor_2d");
     CUDA_CHECK(cudaMemcpy2DAsync(
         data, stride_data, (const char *) tensor->data + offset, stride_tensor, size, n_copies, cudaMemcpyDeviceToHost, cudaStreamPerThread));
     CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
@@ -821,6 +1026,8 @@ static bool ggml_backend_cuda_buffer_cpy_tensor(ggml_backend_buffer_t buffer, co
         // in which case a same-device copy (not a peer copy) is required
         const int src_physical = ggml_cuda_get_physical_device(src_ctx->device);
         const int dst_physical = ggml_cuda_get_physical_device(dst_ctx->device);
+        ggml_backend_cuda_paged_kv_assert_resident(src_ctx, src->data, ggml_nbytes(src), "cpy_tensor_src");
+        ggml_backend_cuda_paged_kv_assert_resident(dst_ctx, dst->data, ggml_nbytes(src), "cpy_tensor_dst");
         if (src_physical == dst_physical) {
             CUDA_CHECK(cudaMemcpyAsync(dst->data, src->data, ggml_nbytes(src), cudaMemcpyDeviceToDevice, cudaStreamPerThread));
         } else {
@@ -842,6 +1049,10 @@ static void ggml_backend_cuda_buffer_clear(ggml_backend_buffer_t buffer, uint8_t
     ggml_backend_cuda_buffer_context * ctx = (ggml_backend_cuda_buffer_context *)buffer->context;
 
     ggml_cuda_set_device(ctx->device);
+    if (ctx->kind == GGML_CUDA_BUFFER_KIND_KV_VMM && ctx->vmm_residency != nullptr) {
+        ggml_backend_cuda_paged_kv_memset_resident(ctx, ctx->dev_ptr, value, buffer->size);
+        return;
+    }
     CUDA_CHECK(cudaMemsetAsync(ctx->dev_ptr, value, buffer->size, cudaStreamPerThread));
     CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
 }
@@ -864,6 +1075,8 @@ static const ggml_backend_buffer_i ggml_backend_cuda_buffer_interface = {
 struct ggml_backend_cuda_buffer_type_context {
     int device;
     std::string name;
+    bool paged_kv = false;
+    bool paged_kv_sparse = false;
 };
 
 static const char * ggml_backend_cuda_buffer_type_get_name(ggml_backend_buffer_type_t buft) {
@@ -876,8 +1089,200 @@ static bool ggml_backend_buft_is_cuda(ggml_backend_buffer_type_t buft) {
     return buft->iface.get_name == ggml_backend_cuda_buffer_type_get_name;
 }
 
+// The ordinary device buffer type and the paged KV buffer type of one device
+// are two objects sharing one interface, so a check that a buffer belongs to
+// this backend's device reads the interface and the device rather than
+// comparing against one of the two pointers.
+static bool ggml_backend_buft_is_cuda_device(ggml_backend_buffer_type_t buft, int device) {
+    return ggml_backend_buft_is_cuda(buft) && ((ggml_backend_cuda_buffer_type_context *) buft->context)->device == device;
+}
+
+#if defined(GGML_USE_VMM)
+static ggml_backend_buffer_t ggml_backend_cuda_paged_kv_alloc_buffer(ggml_backend_buffer_type_t buft, size_t size) {
+    ggml_backend_cuda_buffer_type_context * buft_ctx = (ggml_backend_cuda_buffer_type_context *) buft->context;
+    const int device = buft_ctx->device;
+    const ggml_cuda_device_info::cuda_device_info & device_info = ggml_cuda_info().devices[device];
+
+    if (!device_info.vmm) {
+        GGML_LOG_ERROR("%s: device %d reports no virtual memory management support\n", __func__, device);
+        return nullptr;
+    }
+
+    ggml_cuda_set_device(device);
+
+    const size_t unit = device_info.vmm_granularity_minimum;
+    GGML_ASSERT(unit > 0);
+    const size_t virtual_bytes = GGML_PAD(size, unit);
+
+    // The context owns the reservation and every unit until the backend
+    // buffer takes it, so a host allocation that throws on the way -- the
+    // residency engine's unit table -- unwinds through the destructor rather
+    // than leaking the reservation behind a raw pointer.
+    std::unique_ptr<ggml_backend_cuda_buffer_context> ctx_holder(new ggml_backend_cuda_buffer_context(device, nullptr));
+    ggml_backend_cuda_buffer_context * ctx = ctx_holder.get();
+    ctx->kind = GGML_CUDA_BUFFER_KIND_KV_VMM;
+    ctx->vmm_sparse = buft_ctx->paged_kv_sparse;
+    ctx->vmm_unit_bytes = unit;
+    ctx->vmm_driver = ggml_backend_cuda_paged_kv_driver(ctx);
+
+    if (virtual_bytes > 0) {
+        // The unit table is sized ahead of the reservation, so the one host
+        // allocation on this path happens while nothing device-side is held.
+        ctx->vmm_residency = new ggml_paged_kv_residency(unit, virtual_bytes);
+        CUdeviceptr address = 0;
+        CUresult result = cuMemAddressReserve(&address, virtual_bytes, unit, 0, 0);
+        if (result != CUDA_SUCCESS) {
+            const char * error_name = nullptr;
+            cuGetErrorName(result, &error_name);
+            GGML_LOG_ERROR("%s: reserving %zu bytes of virtual address space on device %d failed: %s\n",
+                           __func__, virtual_bytes, device, error_name ? error_name : "unknown");
+            return nullptr;
+        }
+        ctx->dev_ptr = (void *) address;
+        ctx->vmm_virtual_reserved_bytes = virtual_bytes;
+
+        // The full type commits every unit here as one transaction: create,
+        // map, grant access, zero. A failure at any unit returns the
+        // allocation failure to the caller the way cudaMalloc's path does,
+        // the engine unwinds the units it created, and the destructor frees
+        // the reservation, so a failed unit leaves no handle behind. The KV
+        // constructor turns a null buffer into a named exception, where an
+        // abort here would end the server. The sparse type commits nothing
+        // here: its owner declares the intervals it requires.
+        if (!ctx->vmm_sparse) {
+            std::vector<bool> required(ctx->vmm_residency->unit_count(), true);
+            const ggml_paged_kv_transaction tx = ctx->vmm_residency->commit(required, ctx->vmm_driver);
+            if (!tx.ok) {
+                const char * error_name = nullptr;
+                cuGetErrorName((CUresult) tx.status, &error_name);
+                GGML_LOG_ERROR("%s: committing unit %zu of %zu (%zu bytes) on device %d failed at %s: %s; %zu units unwound\n",
+                               __func__, tx.unit_index, ctx->vmm_residency->unit_count(), unit, device, tx.step,
+                               error_name ? error_name : "unknown", tx.units_unwound);
+                return nullptr;
+            }
+        }
+    }
+
+    const ggml_paged_kv_accounting acct = ctx->vmm_residency != nullptr ? ctx->vmm_residency->accounting() : ggml_paged_kv_accounting{};
+    GGML_LOG_INFO("%s: paged_kv_buffer device=%d requested_bytes=%zu virtual_reserved_bytes=%zu physical_mapped_bytes=%zu"
+                  " unit_bytes=%zu granularity_minimum=%zu granularity_recommended=%zu access=device_rw"
+                  " units=%zu physical_allocated_bytes=%zu physical_retained_unmapped_bytes=%zu physical_released_bytes=%zu"
+                  " residency=%s\n",
+                  __func__, device, size, ctx->vmm_virtual_reserved_bytes, acct.physical_mapped_bytes,
+                  unit, device_info.vmm_granularity_minimum, device_info.vmm_granularity,
+                  ctx->vmm_residency != nullptr ? ctx->vmm_residency->unit_count() : (size_t) 0,
+                  acct.physical_allocated_bytes, acct.physical_retained_unmapped_bytes, acct.physical_released_bytes,
+                  ctx->vmm_sparse ? "tails" : "full");
+
+    // ggml_backend_buffer_init allocates the buffer object with a throwing
+    // new, so ownership of the context passes only after it has succeeded.
+    ggml_backend_buffer_t buffer = ggml_backend_buffer_init(buft, ggml_backend_cuda_buffer_interface, ctx, size);
+    ctx_holder.release();
+    return buffer;
+}
+
+// The residency entry point the KV cache reaches through the proc-address
+// table. The intervals are buffer-relative byte ranges the caller requires
+// resident: every unit they touch is committed, and where reclaim is set
+// every published unit outside them is released after the device quiesces.
+// The full type holds every unit for its whole life, so on it the call
+// verifies the intervals lie inside the reservation and changes nothing. A
+// transaction that changed a unit prints one record carrying the five
+// quantities and its wall-clock latency, so a log states every boundary
+// crossing and nothing per token; a failed commit unwinds and returns false
+// with the previous resident set intact, and a failed reclaim returns false
+// with every unit it could not release still backed.
+bool ggml_backend_cuda_paged_kv_require(ggml_backend_buffer_t buffer, const size_t * offsets, const size_t * sizes, size_t n_ranges, bool reclaim) {
+    if (buffer == nullptr || !ggml_backend_buffer_is_cuda(buffer)) {
+        return false;
+    }
+    ggml_backend_cuda_buffer_context * ctx = (ggml_backend_cuda_buffer_context *) buffer->context;
+    if (ctx->kind != GGML_CUDA_BUFFER_KIND_KV_VMM || ctx->vmm_residency == nullptr) {
+        return false;
+    }
+    ggml_paged_kv_residency & residency = *ctx->vmm_residency;
+    std::vector<bool> required(residency.unit_count(), false);
+    for (size_t i = 0; i < n_ranges; ++i) {
+        if (!residency.require(required, offsets[i], sizes[i])) {
+            GGML_LOG_ERROR("%s: paged_kv_residency interval outside the reservation offset=%zu size=%zu reserved=%zu\n",
+                           __func__, offsets[i], sizes[i], ctx->vmm_virtual_reserved_bytes);
+            return false;
+        }
+    }
+    if (!ctx->vmm_sparse) {
+        return true;
+    }
+
+    ggml_cuda_set_device(ctx->device);
+
+    const auto t0 = std::chrono::steady_clock::now();
+    ggml_paged_kv_transaction tx = residency.commit(required, ctx->vmm_driver);
+    const auto t1 = std::chrono::steady_clock::now();
+    const long long commit_us = std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count();
+    if (!tx.ok) {
+        const char * error_name = nullptr;
+        cuGetErrorName((CUresult) tx.status, &error_name);
+        const ggml_paged_kv_accounting acct = residency.accounting();
+        GGML_LOG_ERROR("%s: paged_kv_residency op=commit result=refused step=%s unit=%zu status=%s units_unwound=%zu"
+                       " units_unwind_failed=%zu"
+                       " units_published=%zu physical_allocated_bytes=%zu physical_mapped_bytes=%zu"
+                       " physical_retained_unmapped_bytes=%zu physical_released_bytes=%zu latency_us=%lld\n",
+                       __func__, tx.step, tx.unit_index, error_name ? error_name : "unknown", tx.units_unwound,
+                       tx.units_unwind_failed,
+                       residency.published_count(), acct.physical_allocated_bytes, acct.physical_mapped_bytes,
+                       acct.physical_retained_unmapped_bytes, acct.physical_released_bytes, commit_us);
+        return false;
+    }
+    if (tx.units_committed > 0) {
+        const ggml_paged_kv_accounting acct = residency.accounting();
+        GGML_LOG_INFO("%s: paged_kv_residency op=commit result=ok units_changed=%zu units_published=%zu"
+                      " physical_allocated_bytes=%zu physical_mapped_bytes=%zu physical_retained_unmapped_bytes=%zu"
+                      " physical_released_bytes=%zu latency_us=%lld\n",
+                      __func__, tx.units_committed, residency.published_count(), acct.physical_allocated_bytes,
+                      acct.physical_mapped_bytes, acct.physical_retained_unmapped_bytes, acct.physical_released_bytes, commit_us);
+    }
+    if (!reclaim) {
+        return true;
+    }
+
+    const auto t2 = std::chrono::steady_clock::now();
+    tx = residency.reclaim(required, ctx->vmm_driver);
+    const auto t3 = std::chrono::steady_clock::now();
+    const long long reclaim_us = std::chrono::duration_cast<std::chrono::microseconds>(t3 - t2).count();
+    const ggml_paged_kv_accounting acct = residency.accounting();
+    if (!tx.ok) {
+        const char * error_name = nullptr;
+        cuGetErrorName((CUresult) tx.status, &error_name);
+        GGML_LOG_ERROR("%s: paged_kv_residency op=reclaim result=refused step=%s unit=%zu status=%s units_changed=%zu"
+                       " units_published=%zu physical_allocated_bytes=%zu physical_mapped_bytes=%zu"
+                       " physical_retained_unmapped_bytes=%zu physical_released_bytes=%zu latency_us=%lld\n",
+                       __func__, tx.step, tx.unit_index, error_name ? error_name : "unknown", tx.units_released,
+                       residency.published_count(), acct.physical_allocated_bytes, acct.physical_mapped_bytes,
+                       acct.physical_retained_unmapped_bytes, acct.physical_released_bytes, reclaim_us);
+        return false;
+    }
+    if (tx.units_released > 0) {
+        GGML_LOG_INFO("%s: paged_kv_residency op=reclaim result=ok units_changed=%zu units_published=%zu"
+                      " physical_allocated_bytes=%zu physical_mapped_bytes=%zu physical_retained_unmapped_bytes=%zu"
+                      " physical_released_bytes=%zu latency_us=%lld\n",
+                      __func__, tx.units_released, residency.published_count(), acct.physical_allocated_bytes,
+                      acct.physical_mapped_bytes, acct.physical_retained_unmapped_bytes, acct.physical_released_bytes, reclaim_us);
+    }
+    return true;
+}
+#endif // defined(GGML_USE_VMM)
+
 static ggml_backend_buffer_t ggml_backend_cuda_buffer_type_alloc_buffer(ggml_backend_buffer_type_t buft, size_t size) {
     ggml_backend_cuda_buffer_type_context * buft_ctx = (ggml_backend_cuda_buffer_type_context *)buft->context;
+
+    if (buft_ctx->paged_kv) {
+#if defined(GGML_USE_VMM)
+        return ggml_backend_cuda_paged_kv_alloc_buffer(buft, size);
+#else
+        GGML_LOG_ERROR("%s: the paged KV buffer type requires a build with GGML_USE_VMM\n", __func__);
+        return nullptr;
+#endif // defined(GGML_USE_VMM)
+    }
 
     ggml_cuda_set_device(buft_ctx->device);
 
@@ -896,9 +1301,20 @@ static ggml_backend_buffer_t ggml_backend_cuda_buffer_type_alloc_buffer(ggml_bac
 }
 
 static size_t ggml_backend_cuda_buffer_type_get_alignment(ggml_backend_buffer_type_t buft) {
-    return 128;
+    ggml_backend_cuda_buffer_type_context * buft_ctx = (ggml_backend_cuda_buffer_type_context *) buft->context;
 
-    GGML_UNUSED(buft);
+    if (buft_ctx->paged_kv) {
+#if defined(GGML_USE_VMM)
+        // The allocator pads every extent to this value and places every
+        // start on it, which is what keeps one mapping unit inside one tensor.
+        const size_t unit = ggml_cuda_info().devices[buft_ctx->device].vmm_granularity_minimum;
+        if (unit > 0) {
+            return unit;
+        }
+#endif // defined(GGML_USE_VMM)
+    }
+
+    return 128;
 }
 
 static size_t ggml_backend_cuda_buffer_type_get_alloc_size(ggml_backend_buffer_type_t buft, const ggml_tensor * tensor) {
@@ -955,6 +1371,56 @@ ggml_backend_buffer_type_t ggml_backend_cuda_buffer_type(int device) {
     }
 
     return &ggml_backend_cuda_buffer_types[device];
+}
+
+// The paged KV buffer types carry the device's own name, because the name is
+// what every placement reader greps for and the buffer is CUDA memory on that
+// device; the allocation kind and the residency policy are stated on the
+// buffer's own record line. The full type and the sparse type of one device
+// are two objects, so a buffer's policy is a property of its type.
+static ggml_backend_buffer_type_t ggml_backend_cuda_paged_kv_buffer_type_impl(int device, bool sparse) {
+    static std::mutex mutex;
+    std::lock_guard<std::mutex> lock(mutex);
+
+    if (device >= ggml_backend_cuda_get_device_count()) {
+        return nullptr;
+    }
+
+#if !defined(GGML_USE_VMM)
+    GGML_UNUSED(sparse);
+    return nullptr;
+#else
+    if (!ggml_cuda_info().devices[device].vmm) {
+        return nullptr;
+    }
+
+    static ggml_backend_buffer_type ggml_backend_cuda_paged_kv_buffer_types[2][GGML_CUDA_MAX_DEVICES];
+
+    static bool ggml_backend_cuda_paged_kv_buffer_type_initialized = false;
+
+    if (!ggml_backend_cuda_paged_kv_buffer_type_initialized) {
+        for (int policy = 0; policy < 2; policy++) {
+            for (int i = 0; i < ggml_backend_cuda_get_device_count(); i++) {
+                ggml_backend_cuda_paged_kv_buffer_types[policy][i] = {
+                    /* .iface    = */ ggml_backend_cuda_buffer_type_interface,
+                    /* .device   = */ ggml_backend_reg_dev_get(ggml_backend_cuda_reg(), i),
+                    /* .context  = */ new ggml_backend_cuda_buffer_type_context{i, GGML_CUDA_NAME + std::to_string(i), true, policy == 1},
+                };
+            }
+        }
+        ggml_backend_cuda_paged_kv_buffer_type_initialized = true;
+    }
+
+    return &ggml_backend_cuda_paged_kv_buffer_types[sparse ? 1 : 0][device];
+#endif // !defined(GGML_USE_VMM)
+}
+
+ggml_backend_buffer_type_t ggml_backend_cuda_paged_kv_buffer_type(int device) {
+    return ggml_backend_cuda_paged_kv_buffer_type_impl(device, false);
+}
+
+ggml_backend_buffer_type_t ggml_backend_cuda_paged_kv_sparse_buffer_type(int device) {
+    return ggml_backend_cuda_paged_kv_buffer_type_impl(device, true);
 }
 
 // Communication context for multi-GPU AllReduce during tensor parallelism.
@@ -2532,7 +2998,8 @@ static void ggml_backend_cuda_set_tensor_async(ggml_backend_t backend, ggml_tens
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
     ggml_backend_buffer_t buf = tensor->view_src ? tensor->view_src->buffer : tensor->buffer;
 
-    GGML_ASSERT(buf->buft == ggml_backend_cuda_buffer_type(cuda_ctx->device) && "unsupported buffer type");
+    GGML_ASSERT(ggml_backend_buft_is_cuda_device(buf->buft, cuda_ctx->device) && "unsupported buffer type");
+    ggml_backend_cuda_paged_kv_assert_resident((ggml_backend_cuda_buffer_context *) buf->context, (char *) tensor->data + offset, size, "set_tensor_async");
 
     CUDA_CHECK(cudaMemcpyAsync((char *) tensor->data + offset, data, size, cudaMemcpyHostToDevice, cuda_ctx->stream()));
 }
@@ -2541,7 +3008,8 @@ static void ggml_backend_cuda_get_tensor_async(ggml_backend_t backend, const ggm
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
     ggml_backend_buffer_t buf = tensor->view_src ? tensor->view_src->buffer : tensor->buffer;
 
-    GGML_ASSERT(buf->buft == ggml_backend_cuda_buffer_type(cuda_ctx->device) && "unsupported buffer type");
+    GGML_ASSERT(ggml_backend_buft_is_cuda_device(buf->buft, cuda_ctx->device) && "unsupported buffer type");
+    ggml_backend_cuda_paged_kv_assert_resident((ggml_backend_cuda_buffer_context *) buf->context, (const char *) tensor->data + offset, size, "get_tensor_async");
 
     CUDA_CHECK(cudaMemcpyAsync(data, (const char *) tensor->data + offset, size, cudaMemcpyDeviceToHost, cuda_ctx->stream()));
 }
@@ -2551,7 +3019,9 @@ static void ggml_backend_cuda_set_tensor_2d_async(ggml_backend_t backend, struct
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
     ggml_backend_buffer_t buf = tensor->view_src ? tensor->view_src->buffer : tensor->buffer;
 
-    GGML_ASSERT(buf->buft == ggml_backend_cuda_buffer_type(cuda_ctx->device) && "unsupported buffer type");
+    GGML_ASSERT(ggml_backend_buft_is_cuda_device(buf->buft, cuda_ctx->device) && "unsupported buffer type");
+    ggml_backend_cuda_paged_kv_assert_resident((ggml_backend_cuda_buffer_context *) buf->context, (char *) tensor->data + offset,
+                                               n_copies > 0 ? (n_copies - 1)*stride_tensor + size : 0, "set_tensor_2d_async");
 
     CUDA_CHECK(cudaMemcpy2DAsync(
         (char *) tensor->data + offset, stride_tensor, data, stride_data, size, n_copies, cudaMemcpyHostToDevice, cuda_ctx->stream()));
@@ -2562,7 +3032,9 @@ static void ggml_backend_cuda_get_tensor_2d_async(ggml_backend_t backend, const 
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
     ggml_backend_buffer_t buf = tensor->view_src ? tensor->view_src->buffer : tensor->buffer;
 
-    GGML_ASSERT(buf->buft == ggml_backend_cuda_buffer_type(cuda_ctx->device) && "unsupported buffer type");
+    GGML_ASSERT(ggml_backend_buft_is_cuda_device(buf->buft, cuda_ctx->device) && "unsupported buffer type");
+    ggml_backend_cuda_paged_kv_assert_resident((ggml_backend_cuda_buffer_context *) buf->context, (const char *) tensor->data + offset,
+                                               n_copies > 0 ? (n_copies - 1)*stride_tensor + size : 0, "get_tensor_2d_async");
 
     CUDA_CHECK(cudaMemcpy2DAsync(
         data, stride_data, (const char *) tensor->data + offset, stride_tensor, size, n_copies, cudaMemcpyDeviceToHost, cuda_ctx->stream()));
@@ -2586,6 +3058,9 @@ static bool ggml_backend_cuda_cpy_tensor_async(ggml_backend_t backend_src, ggml_
 
     ggml_backend_cuda_buffer_context * buf_ctx_src = (ggml_backend_cuda_buffer_context *) buf_src->context;
     ggml_backend_cuda_buffer_context * buf_ctx_dst = (ggml_backend_cuda_buffer_context *) buf_dst->context;
+
+    ggml_backend_cuda_paged_kv_assert_resident(buf_ctx_src, src->data, ggml_nbytes(src), "cpy_tensor_async_src");
+    ggml_backend_cuda_paged_kv_assert_resident(buf_ctx_dst, dst->data, ggml_nbytes(src), "cpy_tensor_async_dst");
 
     if (cuda_ctx_src->device != buf_ctx_src->device || cuda_ctx_dst->device != buf_ctx_dst->device) {
 #ifndef NDEBUG
@@ -4465,12 +4940,12 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                 // On integrated GPUs (APUs, e.g. RDNA3.5) the scheduler may place a
                 // node's output on the host-visible buffer, which the compute path
                 // handles. Allow that here, mirroring the src-tensor check below.
-                assert(node->buffer->buft == ggml_backend_cuda_buffer_type(cuda_ctx->device) ||
+                assert(ggml_backend_buft_is_cuda_device(node->buffer->buft, cuda_ctx->device) ||
                        (integrated && ggml_backend_buft_is_cuda_host(node->buffer->buft)));
                 for (int j = 0; j < GGML_MAX_SRC; j++) {
                     if (node->src[j] != nullptr) {
                         assert(node->src[j]->buffer);
-                        assert(node->src[j]->buffer->buft == ggml_backend_cuda_buffer_type(cuda_ctx->device) ||
+                        assert(ggml_backend_buft_is_cuda_device(node->src[j]->buffer->buft, cuda_ctx->device) ||
                                (integrated && ggml_backend_buft_is_cuda_host(node->src[j]->buffer->buft)));
                     }
                 }
@@ -5926,6 +6401,15 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, "ggml_backend_get_features") == 0) {
         return (void *)ggml_backend_cuda_get_features;
+    }
+    if (strcmp(name, "ggml_backend_cuda_paged_kv_buffer_type") == 0) {
+        return (void *)ggml_backend_cuda_paged_kv_buffer_type;
+    }
+    if (strcmp(name, "ggml_backend_cuda_paged_kv_sparse_buffer_type") == 0) {
+        return (void *)ggml_backend_cuda_paged_kv_sparse_buffer_type;
+    }
+    if (strcmp(name, "ggml_backend_cuda_paged_kv_require") == 0) {
+        return (void *)ggml_backend_cuda_paged_kv_require;
     }
     return nullptr;
 }

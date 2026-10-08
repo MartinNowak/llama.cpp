@@ -216,7 +216,10 @@ public:
     slot_info find_slot(const llama_ubatch & ubatch, bool cont) const;
 
     // emplace the ubatch context into slot: [sinfo.idxs[0...ubatch.n_tokens - 1]]
-    void apply_ubatch(const slot_info & sinfo, const llama_ubatch & ubatch);
+    // returns false where the paged residency policy refused to back the
+    // cells the ubatch occupies; the cells are left as the ubatch set them
+    // and the caller restores or refuses
+    bool apply_ubatch(const slot_info & sinfo, const llama_ubatch & ubatch);
 
     //
     // input API
@@ -319,6 +322,21 @@ private:
 
     // model layer id -> KV cache layer id
     std::unordered_map<int32_t, int32_t> map_layer_ids;
+
+    // env: LLAMA_KV_PAGED_RESIDENCY=tails, over LLAMA_KV_PAGED_BUFFER=1.
+    // The attention KV buffers back the byte intervals this cache declares
+    // and nothing else: every stream of every K and V tensor from row 0 to
+    // the padded attention extent, or the whole tensor around a K-shift or
+    // a cross-stream copy. residency_update() states that set to each paged
+    // buffer through the backend's require entry point, committing the units
+    // it touches and, on a removal, releasing the tail units above it.
+    bool paged_residency_tails = false;
+
+    typedef bool (*paged_kv_require_fn_t)(ggml_backend_buffer_t buffer, const size_t * offsets, const size_t * sizes, size_t n_ranges, bool reclaim);
+
+    std::vector<std::pair<ggml_backend_buffer_t, paged_kv_require_fn_t>> paged_require_fns;
+
+    bool residency_update(bool reclaim, bool whole);
 
     size_t total_size() const;
 

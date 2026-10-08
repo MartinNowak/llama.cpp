@@ -27,6 +27,22 @@ GGML_BACKEND_API bool ggml_backend_is_cuda(ggml_backend_t backend);
 // device buffer
 GGML_BACKEND_API ggml_backend_buffer_type_t ggml_backend_cuda_buffer_type(int device);
 
+// device buffer for attention KV tensors over a virtual memory management
+// reservation: stable addresses, granularity-aligned tensors, fully backed.
+// Reachable through ggml_backend_reg_get_proc_address as
+// "ggml_backend_cuda_paged_kv_buffer_type"; NULL where the device carries no
+// VMM support or the build excludes it.
+GGML_BACKEND_API ggml_backend_buffer_type_t ggml_backend_cuda_paged_kv_buffer_type(int device);
+
+// the same reservation with nothing backed at allocation: the owner declares
+// the buffer-relative byte intervals it requires through
+// ggml_backend_cuda_paged_kv_require, which commits every unit they touch
+// and, where reclaim is set, releases every backed unit outside them after
+// the device quiesces. Reachable as "ggml_backend_cuda_paged_kv_sparse_buffer_type"
+// and "ggml_backend_cuda_paged_kv_require".
+GGML_BACKEND_API ggml_backend_buffer_type_t ggml_backend_cuda_paged_kv_sparse_buffer_type(int device);
+GGML_BACKEND_API bool ggml_backend_cuda_paged_kv_require(ggml_backend_buffer_t buffer, const size_t * offsets, const size_t * sizes, size_t n_ranges, bool reclaim);
+
 // conduct allreduce operation between devices
 GGML_BACKEND_API bool ggml_backend_cuda_allreduce_tensor(ggml_backend_t * backends, struct ggml_tensor ** tensors, size_t n_backends);
 
